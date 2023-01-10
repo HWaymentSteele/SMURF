@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 import random
-from jax.experimental.optimizers import adam
+from jax.example_libraries.optimizers import adam
 
 #################
 # OPT function

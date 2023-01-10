@@ -13,7 +13,7 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 
 # Written by Sergey Ovchinnikov and Sam Petti 
-# Spring 2021
+# Spring 2021 
 
 def sub_sample(x, samples=1024, seed=0):
   np.random.seed(seed)
@@ -96,13 +96,14 @@ def Conv1D_custom(params=None):
 ##############################################################
 
 class MRF:
-    '''GRUMLIN implemented in jax'''
+    '''GREMLIN implemented in jax'''
     def __init__(self, X, lengths=None, ss_hide=0.15, batch_size=128, 
                filters=512, win=18, lam=0.01,
                sw_unroll=4, sw_temp=1.0, sw_learn_temp=False,
                sw_open=None, sw_gap=None, sw_learn_gap=False,
                nat_contacts=None, nat_contacts_mask=None,
-               nat_aln=None, use_nat_aln=False, add_aln_loss=False, aln_lam=1.0,
+               nat_aln=None, use_nat_aln=False, add_aln_loss=False, use_FS_MRF=False,
+               aln_lam=1.0, alt_nat_contacts=None,
                seed=None, lr=0.1, norm_mode="fast",
                learn_bias=True, w_scale=0.1, 
                msa_memory = False, align_to_msa_frac = 0.0, pid_thresh = 1.0, pseudo = False):
@@ -116,6 +117,7 @@ class MRF:
         self.X_ref_len = self.lengths[0]
 
         self.nat_contacts = nat_contacts
+        self.alt_nat_contacts = alt_nat_contacts
         self.nat_contacts_mask = nat_contacts_mask
         self.nat_aln = nat_aln
 
@@ -132,7 +134,9 @@ class MRF:
                   "filters":filters, "win":win,
                   "x_ref_len":self.X_ref_len,
                   "ss_hide":ss_hide, "lam":lam*ss_hide*batch_size/N,
-                  "use_nat_aln":use_nat_aln, "add_aln_loss":add_aln_loss, "aln_lam":aln_lam,
+                  "use_nat_aln":use_nat_aln, "add_aln_loss":add_aln_loss, 
+                  "use_FS_MRF": use_FS_MRF,
+                  "aln_lam":aln_lam,
                   "norm_mode":norm_mode,
                   "learn_bias":learn_bias,"w_scale":w_scale, "msa_memory":msa_memory, 
                   "align_to_msa_frac":align_to_msa_frac, "pid_thresh":pid_thresh, "pseudo":pseudo}
@@ -154,6 +158,9 @@ class MRF:
             _params = {"mrf": laxy.MRF()(p["x_ref_len"], p["A"],
                                        use_bias=p["learn_bias"], key=self.key.get())}
             _params["emb"] = Conv1D_custom()(p["A"],p["filters"],p["win"],key=self.key.get())
+            initializer = jax.nn.initializers.normal(1)
+            _params['sequence_weights'] = initializer(self.key.get(), (p["N"],), jnp.float32) 
+#            _params['sequence_weights'] = -1 * jnp.ones(p["N"], dtype = jnp.float32)
 
             _params["open"] = p["sw_open"]
             _params["gap"] = p["sw_gap"]
@@ -244,6 +251,11 @@ class MRF:
 
             # align, gremlin, unalign
             x_msa = jnp.einsum("nia,nij->nja", x_ms_in, aln)
+
+            # # apply soft weight to each
+            scaled_wts = 1+ 0.5*jnp.tanh(params['sequence_weights'])[..., None, None]
+            x_msa = scaled_wts * x_msa
+
             x_msa_pred, w = laxy.MRF(params["mrf"])(x_msa, return_w=True)
             if p["learn_bias"] == False:
                 x_msa_pred += jnp.log(x_msa.sum(0) + 0.01 * p["batch_size"])
@@ -260,6 +272,14 @@ class MRF:
             cce_loss = -(x_ms_out * jnp.log(x_ms_pred + 1e-8)).sum()
             loss = cce_loss + p["lam"] * l2_loss
 
+            # seq weights regularization
+            seq_wt_loss = jnp.square(scaled_wts).sum()
+            loss += 100* seq_wt_loss
+
+            if p["use_FS_MRF"]:
+                contacts = self.get_contacts()
+                loss += jnp.sum(jnp.square(jnp.subtract(contacts, self.nat_contacts)))
+
             if p["add_aln_loss"]:
                 a_bce = -inputs["aln"] * jnp.log(aln + 1e-8)
                 b_bce = -jax.nn.relu(1-inputs["aln"]) * jnp.log(jax.nn.relu(1-aln) + 1e-8)
@@ -271,7 +291,7 @@ class MRF:
         if initialize_params: return _params, _model
         else: return _model
   #####################################################################################################
-  #####################################################################################################
+  #####################################################################################################   
 
     def get_contacts(self, return_params=False):
         '''get contact map from W matrix'''
@@ -301,6 +321,12 @@ class MRF:
                        true=self.nat_contacts,
                        mask=self.nat_contacts_mask)
 
+    def get_alt_auc(self):
+        contacts = np.array(self.get_contacts())
+        return con_auc(pred=contacts,
+                       true=self.alt_nat_contacts,
+                       mask=self.nat_contacts_mask)
+
     def get_aln(self, idx):
         '''get alignment'''
         inputs = {"x":self.X[idx], "lengths":self.lengths[idx],
@@ -315,12 +341,14 @@ class MRF:
         for k in range(steps):
             idx = np.random.randint(0,self.X.shape[0],size=self.p["batch_size"])
             inputs = {"x":self.X[idx], "lengths":self.lengths[idx],
-                    "x_ref":self.X_ref, "key":self.key.get(10)}
+                    "x_ref":self.X_ref, "key":self.key.get(10)}  
             if self.p["use_nat_aln"] or self.p["add_aln_loss"]: inputs["aln"] = self.nat_aln[idx]
             loss += self.opt.train_on_batch(inputs)
             if verbose and (k+1) % (steps//10) == 0:
                 print_line,loss = [k+1, loss/(steps//10)],0
                 if self.nat_contacts is not None: print_line.append(self.get_auc())
+
+                if self.alt_nat_contacts is not None: print_line.append(self.get_alt_auc())
                 if self.p["sw_learn_gap"]:
                     if self.p["sw_open"] is not None: print_line.append(self.opt.get_params()["open"])
                     if self.p["sw_gap"] is not None: print_line.append(self.opt.get_params()["gap"])
