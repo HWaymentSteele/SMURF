@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+from jax import lax
 import numpy as np
 import matplotlib.pyplot as plt
 import laxy
@@ -45,6 +46,31 @@ def con_auc(true, pred, mask=None, thresh=0.01):
   sort_idx = np.argsort(pred_)[::-1]
   acc = [(true_[sort_idx[:l]] > thresh).mean() for l in L]
   return np.mean(acc)
+
+def jnp_con_auc(true, pred, mask=None, thresh=0.01):
+  '''compute agreement between predicted and measured contact map'''
+
+  eval_idx = jnp.triu_indices_from(true, 6)
+
+  true = jnp.asarray(true)
+  pred = jnp.asarray(pred)
+
+  if mask is not None:
+    idx = mask.sum(-1) > 0
+    true = true[idx,:][:,idx]
+    pred = pred[idx,:][:,idx]
+  pred_, true_ = pred[eval_idx], true[eval_idx]
+
+  L = (np.linspace(0.1,1.0,10)*len(true)).astype("int")
+
+  sort_idx = jnp.argsort(pred_)[::-1]
+  acc=[]
+  for l in L:
+    tmp = lax.dynamic_slice(sort_idx,[0,],[l,])
+    acc.append(jnp.mean(true_[tmp]>thresh))
+
+  return jnp.mean(jnp.asarray(acc))
+
 
 def clear_mem():
   backend = jax.lib.xla_bridge.get_backend()
@@ -102,8 +128,8 @@ class MRF:
                sw_unroll=4, sw_temp=1.0, sw_learn_temp=False,
                sw_open=None, sw_gap=None, sw_learn_gap=False,
                nat_contacts=None, nat_contacts_mask=None,
-               nat_aln=None, use_nat_aln=False, add_aln_loss=False, use_FS_MRF=False,
-               aln_lam=1.0, alt_nat_contacts=None,
+               nat_aln=None, use_nat_aln=False, add_aln_loss=False, supervised=False,
+               aln_lam=1.0, alt_nat_contacts=None,TEST=False,
                seed=None, lr=0.1, norm_mode="fast",
                learn_bias=True, w_scale=0.1, 
                msa_memory = False, align_to_msa_frac = 0.0, pid_thresh = 1.0, pseudo = False):
@@ -135,8 +161,8 @@ class MRF:
                   "x_ref_len":self.X_ref_len,
                   "ss_hide":ss_hide, "lam":lam*ss_hide*batch_size/N,
                   "use_nat_aln":use_nat_aln, "add_aln_loss":add_aln_loss, 
-                  "use_FS_MRF": use_FS_MRF,
-                  "aln_lam":aln_lam,
+                  "supervised": supervised,
+                  "aln_lam":aln_lam, "TEST": TEST,
                   "norm_mode":norm_mode,
                   "learn_bias":learn_bias,"w_scale":w_scale, "msa_memory":msa_memory, 
                   "align_to_msa_frac":align_to_msa_frac, "pid_thresh":pid_thresh, "pseudo":pseudo}
@@ -159,8 +185,8 @@ class MRF:
                                        use_bias=p["learn_bias"], key=self.key.get())}
             _params["emb"] = Conv1D_custom()(p["A"],p["filters"],p["win"],key=self.key.get())
             initializer = jax.nn.initializers.normal(1)
-            _params['sequence_weights'] = initializer(self.key.get(), (p["N"],), jnp.float32) 
-#            _params['sequence_weights'] = -1 * jnp.ones(p["N"], dtype = jnp.float32)
+            _params['sequence_weights'] = initializer(self.key.get(), (p["N"],), jnp.float32)
+            #_params['sequence_weights'] = jnp.concatenate([jnp.ones(250, dtype = jnp.float32), -1*jnp.ones(250, dtype = jnp.float32)])
 
             _params["open"] = p["sw_open"]
             _params["gap"] = p["sw_gap"]
@@ -195,56 +221,17 @@ class MRF:
         #######################
         def _model(params, inputs):      
             # self-supervision (aka. masked-language-modeling)
-            x_ms_in, x_ms_out = self_sup(inputs["x"], key=inputs["key"][0])
+            if p['TEST']:
+              #tmp = jnp.concatenate([jnp.ones(250, dtype = jnp.float32), jnp.zeros(250, dtype = jnp.float32)])[...,None,None]
+              rescaled_wts = 1+ jnp.tanh(params['sequence_weights'])[...,None,None]
+              rescaled_input = inputs["x"] * rescaled_wts
+              x_ms_in, x_ms_out = self_sup(rescaled_input, key=inputs["key"][0])
+
+            else:
+              x_ms_in, x_ms_out = self_sup(inputs["x"], key=inputs["key"][0])
 
             if p["use_nat_aln"]:
                 aln = p_aln = inputs["aln"]
-                
-            else:
-            # concatentate reference, get positional embedding
-                x_ms_in_ = jnp.concatenate([inputs["x_ref"], x_ms_in],0)
-                emb = Conv1D_custom(params["emb"])(x_ms_in_,key=inputs["key"][1],scale=p["w_scale"])
-
-                # get alignment to reference
-                if p["align_to_msa_frac"]>0:
-                    embedded_msa = Conv1D_custom(params["emb"])(params["msa"][None,...],key=inputs["key"][1],scale=p["w_scale"])
-                    embedded_msa = embedded_msa[0,:p["x_ref_len"],...]
-                    sm_mtx = emb[1:] @ ((1-self.p["align_to_msa_frac"]) * emb[0,:p["x_ref_len"]].T + self.p["align_to_msa_frac"] * embedded_msa.T)
-                else:
-                    sm_mtx = emb[1:] @ emb[0,:p["x_ref_len"]].T
-                    
-                # mask
-                sm_mask = jnp.broadcast_to(inputs["x"].sum(-1,keepdims=True), sm_mtx.shape)
-                lengths = jnp.stack([inputs["lengths"],
-                                     jnp.broadcast_to(p["x_ref_len"],inputs["lengths"].shape)],-1)
-                
-                # normalize rows/cols (to remove edge effects due to 1D-convolution)
-                sm_mtx = norm_row_col(sm_mtx, sm_mask, p["norm_mode"])
-                
-                
-                if p["pseudo"]:
-                    aln = jnp.sqrt(jax.nn.softmax(sm_mtx, axis=-1) * jax.nn.softmax(sm_mtx, axis=-2))
-                else:
-                    sm_open = params["open"] if p["sw_learn_gap"] else laxy.freeze(params["open"])
-                    sm_gap = params["gap"] if p["sw_learn_gap"] else laxy.freeze(params["gap"])
-                    sm_temp = params["temp"] if p["sw_learn_temp"] else laxy.freeze(params["temp"])
-                    aln = get_aln(sm_mtx, lengths, gap=sm_gap, open=sm_open, temp=sm_temp, key=inputs["key"][1])
-                    
-                x_msa = jnp.einsum("nia,nij->nja", x_ms_in, aln)
-                x_msa_bias = x_msa.mean(0)
-  
-                # update MSA 
-                if self.p["msa_memory"] != False:
-                    if p["pid_thresh"]<=1.0 and p["pid_thresh"]>0:
-                        pid  = jnp.einsum('nla,la->n', x_msa, x_msa[0,...])/ x_msa.shape[1]
-                        x_msa_restricted = jnp.einsum('nia,n->nia',x_msa, (pid > p["pid_thresh"]))
-                        num_surviving_seqs = (pid > p["pid_thresh"]).sum() + 1
-                        x_msa_bias_restricted = (self.X[0,:p["x_ref_len"],...] + x_msa_restricted.sum(axis = 0))/num_surviving_seqs
-                    else:
-                        x_msa_bias_restricted = x_msa_bias
-                    params["msa"] = self.p["msa_memory"] * params["msa"] + (1-self.p["msa_memory"])* x_msa_bias_restricted[:p["x_ref_len"],...]
-
-                laxy.freeze(params["msa"])
 
             if return_aln:
                 return aln, sm_mtx
@@ -253,8 +240,7 @@ class MRF:
             x_msa = jnp.einsum("nia,nij->nja", x_ms_in, aln)
 
             # # apply soft weight to each
-            scaled_wts = 1+ 0.5*jnp.tanh(params['sequence_weights'])[..., None, None]
-            x_msa = scaled_wts * x_msa
+            #scaled_wts = params['sequence_weights'][..., None, None]
 
             x_msa_pred, w = laxy.MRF(params["mrf"])(x_msa, return_w=True)
             if p["learn_bias"] == False:
@@ -273,12 +259,12 @@ class MRF:
             loss = cce_loss + p["lam"] * l2_loss
 
             # seq weights regularization
-            seq_wt_loss = jnp.square(scaled_wts).sum()
-            loss += 100* seq_wt_loss
+            seq_wt_loss = jnp.square(1+jnp.tanh(params['sequence_weights'])).mean()
+            loss += seq_wt_loss
 
-            if p["use_FS_MRF"]:
+            if p["supervised"]:
                 contacts = self.get_contacts()
-                loss += jnp.sum(jnp.square(jnp.subtract(contacts, self.nat_contacts)))
+                loss += 500*(1-jnp_con_auc(pred=contacts,true=self.nat_contacts))
 
             if p["add_aln_loss"]:
                 a_bce = -inputs["aln"] * jnp.log(aln + 1e-8)
@@ -339,7 +325,8 @@ class MRF:
         '''train model'''
         loss = 0
         for k in range(steps):
-            idx = np.random.randint(0,self.X.shape[0],size=self.p["batch_size"])
+            #idx = np.random.randint(0,self.X.shape[0],size=self.p["batch_size"])
+            idx = np.arange(0, self.X.shape[0])
             inputs = {"x":self.X[idx], "lengths":self.lengths[idx],
                     "x_ref":self.X_ref, "key":self.key.get(10)}  
             if self.p["use_nat_aln"] or self.p["add_aln_loss"]: inputs["aln"] = self.nat_aln[idx]
