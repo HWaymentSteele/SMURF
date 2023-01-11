@@ -160,6 +160,86 @@ def MRF(params=None):
 
   if params is None: return init_params
   else: return layer
+  
+
+def _MRF(params=None):
+  '''
+  markov random field layer
+  ----------------------------------------------------
+  params = MRF()(L=length, A=alphabet, use_bias=True)
+  output = MRF(params)(input, return_w=False)
+  '''
+  def init_params(L, A, use_bias=True, key=None, seed=None):
+    initializer = jax.nn.initializers.normal(0.01)
+
+    params = {"w":initializer(key, (L,A,L,A), jnp.float32)}
+    if use_bias: params["b"] = jnp.zeros((L,A))
+    return params
+  
+  def layer(x, return_w=False, rm_diag=True, symm=True, mask=None):
+    w = params["w"]
+    L,A = w.shape[:2]
+    if rm_diag:
+      # set diagonal to zero
+      w = w * (1-jnp.eye(L)[:,None,:,None])
+    if symm:
+      # symmetrize
+      w = 0.5 * (w + w.transpose([2,3,0,1]))
+    if mask is not None:
+      w = w * mask[:,None,:,None]      
+      
+    y = jnp.tensordot(x,w,2) # x (N,L,A), w (L,A,L,A)
+    if "b" in params: y += params["b"]
+      
+    if return_w: return y,w
+    else: return y
+
+  if params is None: return init_params
+  else: return layer
+
+def FactoredAttention(params=None):
+  '''
+  Factored attention markov random field layer
+  ----------------------------------------------------
+  params = MRF()(L=length, A=alphabet, H = n_heads, use_bias=True)
+  output = MRF(params)(input, return_w=False)
+  '''
+  def init_params(L, A, H, use_bias=True, key=None, seed=None):
+    initializer = jax.nn.initializers.normal(0.01)
+    params = {"w_v":initializer(key, (H,A,A), jnp.float32), #hij
+              "w_A": initializer(key, (H,L,L), jnp.float32)} #hab
+    if use_bias: params["b"] = jnp.zeros((L,A))
+    return params
+  
+  def layer(x, return_w=False, rm_diag=True, symm=True, mask=None):
+    w_A = params["w_A"]
+    w_v = params["w_v"]
+    L = w_A.shape[1]
+    A = w_v.shape[1]
+
+    w_A = jax.nn.softmax(w_A, axis=1)
+
+    if rm_diag:
+      # set diagonal to zero
+      w_A = w_A * (1-jnp.eye(L)[None,:,:])
+    if symm:
+      # symmetrize
+      #w_A = 0.5 * (w_A + w_A.transpose([1,0,2]))
+      w_v = 0.5 * (w_v + w_v.transpose([0,2,1]))
+    if mask is not None:
+      w_A = w_A * mask[None,:,:]      
+
+    weights = jnp.einsum("hij,hab->iajb", w_A, w_v)  # L x A x L x A
+    y = jnp.tensordot(x, weights, axes=2) 
+    # print(y.shape) N x L x A
+
+    if "b" in params: y += params["b"]
+      
+    if return_w: return y, w_A, w_v
+    else: return y
+
+  if params is None: return init_params
+  else: return layer
 
 def Conv1D(params=None):
   '''
