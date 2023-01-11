@@ -71,7 +71,6 @@ def jnp_con_auc(true, pred, mask=None, thresh=0.01):
 
   return jnp.mean(jnp.asarray(acc))
 
-
 def clear_mem():
   backend = jax.lib.xla_bridge.get_backend()
   for buf in backend.live_buffers(): buf.delete()
@@ -237,10 +236,10 @@ class MODEL:
         #######################
         if initialize_params:
           if p['model_type']=='potts':
-              _params = {"mrf": _MRF()(p["x_ref_len"], p["A"],
+              _params = {"mrf": laxy.MRF()(p["x_ref_len"], p["A"],
                                         use_bias=p["learn_bias"], key=self.key.get())}
           elif p['model_type']=='FactoredAttention':
-              _params = {"mrf": _FactoredAttention()(p["x_ref_len"], p["A"], p['H'],
+              _params = {"mrf": laxy.FactoredAttention()(p["x_ref_len"], p["A"], p['H'],
                                         use_bias=p["learn_bias"], key=self.key.get())}
 
           _params["msa"] = self.X[0,:p["x_ref_len"],...]
@@ -278,11 +277,11 @@ class MODEL:
             x_msa = jnp.einsum("nia,nij->nja", x_ms_in, aln)
 
             if self.model_type=='potts':
-              x_msa_pred, w = _MRF(params["mrf"])(x_msa, return_w=True)
+              x_msa_pred, w = laxy.MRF(params["mrf"])(x_msa, return_w=True)
               l2_loss = 0.5*(p["L"]-1)*(p["A"]-1)*jnp.square(w).sum() 
 
             elif self.model_type=='FactoredAttention':
-              x_msa_pred, w_A, w_v = _FactoredAttention(params["mrf"])(x_msa, return_w=True)
+              x_msa_pred, w_A, w_v = laxy.FactoredAttention(params["mrf"])(x_msa, return_w=True)
               l2_loss = 0.5*(p["L"]-1)*(p["A"]-1)*(jnp.square(w_v).sum()+jnp.square(w_A).sum())
 
             if p["learn_bias"] == False:
