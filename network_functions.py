@@ -121,17 +121,73 @@ def Conv1D_custom(params=None):
 
 ##############################################################
 
-class MRF:
-    '''GREMLIN implemented in jax'''
+def sub_sample(x, samples=1024, seed=0):
+  np.random.seed(seed)
+  idx = np.arange(1,len(x))
+  idx = np.random.choice(idx,samples-1,replace=False)
+  idx = np.append(0,idx)
+  return [x[i] for i in idx]
+
+def pad_max(a, pad=-1):
+  max_L = len(max(a,key = lambda x: len(x)))
+  b = np.full([len(a),max_L], pad)
+  for i,j in enumerate(a): b[i][0:len(j)] = j
+  return b
+
+def one_hot(x,cat=None):
+  if cat is None: cat = np.max(x)+1
+  oh = np.concatenate((np.eye(cat),np.zeros([1,cat])))
+  return oh[x]
+
+def con_auc(true, pred, mask=None, thresh=0.01):
+  '''compute agreement between predicted and measured contact map'''
+  if mask is not None:
+    idx = mask.sum(-1) > 0
+    true = true[idx,:][:,idx]
+    pred = pred[idx,:][:,idx]
+  eval_idx = np.triu_indices_from(true, 6)
+  pred_, true_ = pred[eval_idx], true[eval_idx] 
+  L = (np.linspace(0.1,1.0,10)*len(true)).astype("int")
+  sort_idx = np.argsort(pred_)[::-1]
+  acc = [(true_[sort_idx[:l]] > thresh).mean() for l in L]
+  return np.mean(acc)
+
+def jnp_con_auc(true, pred, mask=None, thresh=0.01):
+  '''compute agreement between predicted and measured contact map'''
+
+  eval_idx = jnp.triu_indices_from(true, 6)
+
+  true = jnp.asarray(true)
+  pred = jnp.asarray(pred)
+
+  if mask is not None:
+    idx = mask.sum(-1) > 0
+    true = true[idx,:][:,idx]
+    pred = pred[idx,:][:,idx]
+  pred_, true_ = pred[eval_idx], true[eval_idx]
+
+  L = (np.linspace(0.1,1.0,10)*len(true)).astype("int")
+
+  sort_idx = jnp.argsort(pred_)[::-1]
+  acc=[]
+  for l in L:
+    tmp = lax.dynamic_slice(sort_idx,[0,],[l,])
+    acc.append(jnp.mean(true_[tmp]>thresh))
+
+  return jnp.mean(jnp.asarray(acc))
+
+def clear_mem():
+  backend = jax.lib.xla_bridge.get_backend()
+  for buf in backend.live_buffers(): buf.delete()
+
+class MODEL:
     def __init__(self, X, lengths=None, ss_hide=0.15, batch_size=128, 
-               filters=512, win=18, lam=0.01,
-               sw_unroll=4, sw_temp=1.0, sw_learn_temp=False,
-               sw_open=None, sw_gap=None, sw_learn_gap=False,
+               filters=512, win=18, lam=0.01, model_type='FactoredAttention',
                nat_contacts=None, nat_contacts_mask=None,
                nat_aln=None, use_nat_aln=False, add_aln_loss=False, supervised=False,
                aln_lam=1.0, alt_nat_contacts=None,TEST=False,
                seed=None, lr=0.1, norm_mode="fast",
-               learn_bias=True, w_scale=0.1, 
+               learn_bias=True, w_scale=0.1, H=10,
                msa_memory = False, align_to_msa_frac = 0.0, pid_thresh = 1.0, pseudo = False):
 
         N,L,A = X.shape
@@ -141,6 +197,8 @@ class MRF:
         self.lengths = X.sum([1,2]).astype(int) if lengths is None else lengths
         self.X_ref = self.X[:1]
         self.X_ref_len = self.lengths[0]
+
+        self.model_type=model_type
 
         self.nat_contacts = nat_contacts
         self.alt_nat_contacts = alt_nat_contacts
@@ -154,16 +212,13 @@ class MRF:
 
         # params
         self.p = {"N":N, "L":L, "A":A, "batch_size":batch_size,
-                  "sw_temp":sw_temp,"sw_learn_temp":sw_learn_temp,
-                  "sw_unroll":sw_unroll,
-                  "sw_open":sw_open,"sw_gap":sw_gap,"sw_learn_gap":sw_learn_gap,
                   "filters":filters, "win":win,
                   "x_ref_len":self.X_ref_len,
                   "ss_hide":ss_hide, "lam":lam*ss_hide*batch_size/N,
                   "use_nat_aln":use_nat_aln, "add_aln_loss":add_aln_loss, 
-                  "supervised": supervised,
+                  "supervised": supervised,'model_type':model_type,
                   "aln_lam":aln_lam, "TEST": TEST,
-                  "norm_mode":norm_mode,
+                  "norm_mode":norm_mode,"H": H,
                   "learn_bias":learn_bias,"w_scale":w_scale, "msa_memory":msa_memory, 
                   "align_to_msa_frac":align_to_msa_frac, "pid_thresh":pid_thresh, "pseudo":pseudo}
 
@@ -181,17 +236,14 @@ class MRF:
         # initialize params
         #######################
         if initialize_params:
-            _params = {"mrf": laxy.MRF()(p["x_ref_len"], p["A"],
-                                       use_bias=p["learn_bias"], key=self.key.get())}
-            _params["emb"] = Conv1D_custom()(p["A"],p["filters"],p["win"],key=self.key.get())
-            initializer = jax.nn.initializers.normal(1)
-            _params['sequence_weights'] = initializer(self.key.get(), (p["N"],), jnp.float32)
-            #_params['sequence_weights'] = jnp.concatenate([jnp.ones(250, dtype = jnp.float32), -1*jnp.ones(250, dtype = jnp.float32)])
+          if p['model_type']=='potts':
+              _params = {"mrf": _MRF()(p["x_ref_len"], p["A"],
+                                        use_bias=p["learn_bias"], key=self.key.get())}
+          elif p['model_type']=='FactoredAttention':
+              _params = {"mrf": _FactoredAttention()(p["x_ref_len"], p["A"], p['H'],
+                                        use_bias=p["learn_bias"], key=self.key.get())}
 
-            _params["open"] = p["sw_open"]
-            _params["gap"] = p["sw_gap"]
-            _params["temp"] = p["sw_temp"]
-            _params["msa"] = self.X[0,:p["x_ref_len"],...]
+          _params["msa"] = self.X[0,:p["x_ref_len"],...]
 
         # self-supervision
         def self_sup(x, key=None):
@@ -202,19 +254,6 @@ class MRF:
                 mask = (tmp > p["ss_hide"]).astype(x.dtype)
                 return x*mask, x*(1-mask)
 
-        # get alignment
-        def get_aln(z, lengths, gap=None, open=None, temp=1.0, key=None): 
-            # local-alignment (smith-waterman)
-            if gap is None:
-                aln_app = sw.sw_nogap(batch=True, unroll=p["sw_unroll"])
-                aln = aln_app(z, lengths, temp)
-            elif open is None:
-                aln_app = sw.sw(batch=True, unroll=p["sw_unroll"])
-                aln = aln_app(z, lengths, gap, temp)
-            else:
-                aln_app = sw.sw_affine(restrict_turns=True, batch=True, unroll=p["sw_unroll"])
-                aln = aln_app(z, lengths, gap, open, temp)
-            return aln
 
         #######################
         # setup the model
@@ -222,8 +261,7 @@ class MRF:
         def _model(params, inputs):      
             # self-supervision (aka. masked-language-modeling)
             if p['TEST']:
-              #tmp = jnp.concatenate([jnp.ones(250, dtype = jnp.float32), jnp.zeros(250, dtype = jnp.float32)])[...,None,None]
-              rescaled_wts = 1+ jnp.tanh(params['sequence_weights'])[...,None,None]
+              rescaled_wts = 1+ 0.5*jnp.tanh(params['sequence_weights'])[...,None,None]
               rescaled_input = inputs["x"] * rescaled_wts
               x_ms_in, x_ms_out = self_sup(rescaled_input, key=inputs["key"][0])
 
@@ -234,15 +272,19 @@ class MRF:
                 aln = p_aln = inputs["aln"]
 
             if return_aln:
-                return aln, sm_mtx
+                return aln
 
             # align, gremlin, unalign
             x_msa = jnp.einsum("nia,nij->nja", x_ms_in, aln)
 
-            # # apply soft weight to each
-            #scaled_wts = params['sequence_weights'][..., None, None]
+            if self.model_type=='potts':
+              x_msa_pred, w = _MRF(params["mrf"])(x_msa, return_w=True)
+              l2_loss = 0.5*(p["L"]-1)*(p["A"]-1)*jnp.square(w).sum() 
 
-            x_msa_pred, w = laxy.MRF(params["mrf"])(x_msa, return_w=True)
+            elif self.model_type=='FactoredAttention':
+              x_msa_pred, w_A, w_v = _FactoredAttention(params["mrf"])(x_msa, return_w=True)
+              l2_loss = 0.5*(p["L"]-1)*(p["A"]-1)*(jnp.square(w_v).sum()+jnp.square(w_A).sum())
+
             if p["learn_bias"] == False:
                 x_msa_pred += jnp.log(x_msa.sum(0) + 0.01 * p["batch_size"])
             x_ms_pred_logits = jnp.einsum("nja,nij->nia", x_msa_pred, aln)
@@ -250,7 +292,6 @@ class MRF:
             x_ms_pred = jax.nn.softmax(x_ms_pred_logits, -1)
 
             # regularization
-            l2_loss = 0.5*(p["L"]-1)*(p["A"]-1)*jnp.square(w).sum() 
             if p["learn_bias"]:
                 l2_loss += jnp.square(params["mrf"]["b"]).sum()
 
@@ -258,9 +299,12 @@ class MRF:
             cce_loss = -(x_ms_out * jnp.log(x_ms_pred + 1e-8)).sum()
             loss = cce_loss + p["lam"] * l2_loss
 
-            # seq weights regularization
-            seq_wt_loss = jnp.square(1+jnp.tanh(params['sequence_weights'])).mean()
-            loss += seq_wt_loss
+            if p['TEST']:
+              #seq weights regularization
+              seq_l2_loss = jnp.square(params['sequence_weights']).mean()
+              seq_net_loss = jnp.square(1+jnp.tanh(params['sequence_weights'])).mean()
+
+              loss += seq_l2_loss + seq_net_loss
 
             if p["supervised"]:
                 contacts = self.get_contacts()
@@ -286,16 +330,29 @@ class MRF:
             y = x - (a1*a2)/x.sum()
             return y * (1-jnp.eye(x.shape[0]))
 
-        # symmetrize and zero diag
-        w = self.opt.get_params()["mrf"]["w"]
-        #b = self.opt.get_params()["mrf"]["b"]
-        w = (w + w.transpose([2,3,0,1]))/2
-        w = w * (1-jnp.eye(self.p["x_ref_len"])[:,None,:,None])
+        if self.model_type=='potts':
+          # symmetrize and zero diag
+          w = self.opt.get_params()["mrf"]["w"]
+          #b = self.opt.get_params()["mrf"]["b"]
+          w = (w + w.transpose([2,3,0,1]))/2
+          w = w * (1-jnp.eye(self.p["x_ref_len"])[:,None,:,None])
+          contacts = jnp.sqrt(jnp.square(w).sum((1,3)))
+          if return_params: return w #,b
+          return _apc(contacts)
 
-        if return_params: return w #,b
+        elif self.model_type=='FactoredAttention':
+          w_A = self.opt.get_params()["mrf"]["w_A"]
+          w_v = self.opt.get_params()["mrf"]["w_v"]
 
-        contacts = jnp.sqrt(jnp.square(w).sum((1,3)))
-        return _apc(contacts)
+          w_A = jax.nn.softmax(w_A,axis=1)
+
+          w = jnp.einsum("hij,hab->iajb", w_A, w_v)
+          w = (w + w.transpose([2,3,0,1]))/2
+          w = w * (1-jnp.eye(self.p["x_ref_len"])[:,None,:,None])
+
+          contacts = jnp.sqrt(jnp.square(w)).sum((1,3))
+          if return_params: return w_A, w_v #,b
+          return _apc(contacts)
 
     def get_auc(self):
         '''get contact accuracy'''
@@ -328,18 +385,13 @@ class MRF:
             #idx = np.random.randint(0,self.X.shape[0],size=self.p["batch_size"])
             idx = np.arange(0, self.X.shape[0])
             inputs = {"x":self.X[idx], "lengths":self.lengths[idx],
-                    "x_ref":self.X_ref, "key":self.key.get(10)}  
+                    "x_ref":self.X_ref, "key":self.key.get(10)}
             if self.p["use_nat_aln"] or self.p["add_aln_loss"]: inputs["aln"] = self.nat_aln[idx]
             loss += self.opt.train_on_batch(inputs)
             if verbose and (k+1) % (steps//10) == 0:
                 print_line,loss = [k+1, loss/(steps//10)],0
                 if self.nat_contacts is not None: print_line.append(self.get_auc())
-
                 if self.alt_nat_contacts is not None: print_line.append(self.get_alt_auc())
-                if self.p["sw_learn_gap"]:
-                    if self.p["sw_open"] is not None: print_line.append(self.opt.get_params()["open"])
-                    if self.p["sw_gap"] is not None: print_line.append(self.opt.get_params()["gap"])
-                if self.p["sw_learn_temp"]: print_line.append(self.opt.get_params()["temp"])
                 print(*print_line)
     
     def reset_model_and_opt(self, new_p):
