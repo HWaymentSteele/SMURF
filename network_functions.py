@@ -16,10 +16,10 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 # Written by Sergey Ovchinnikov and Sam Petti 
 # Spring 2021 
 
-def sub_sample(x, samples=1024, seed=0):
+def sub_sample(x, samples=1024, seed=0,replace=False):
   np.random.seed(seed)
   idx = np.arange(1,len(x))
-  idx = np.random.choice(idx,samples-1,replace=False)
+  idx = np.random.choice(idx,samples-1,replace=replace)
   idx = np.append(0,idx)
   return [x[i] for i in idx]
 
