@@ -34,47 +34,6 @@ def one_hot(x,cat=None):
   oh = np.concatenate((np.eye(cat),np.zeros([1,cat])))
   return oh[x]
 
-def con_auc(true, pred, mask=None, thresh=0.01):
-  '''compute agreement between predicted and measured contact map'''
-  if mask is not None:
-    idx = mask.sum(-1) > 0
-    true = true[idx,:][:,idx]
-    pred = pred[idx,:][:,idx]
-  eval_idx = np.triu_indices_from(true, 6)
-  pred_, true_ = pred[eval_idx], true[eval_idx] 
-  L = (np.linspace(0.1,1.0,10)*len(true)).astype("int")
-  sort_idx = np.argsort(pred_)[::-1]
-  acc = [(true_[sort_idx[:l]] > thresh).mean() for l in L]
-  return np.mean(acc)
-
-def jnp_con_auc(true, pred, mask=None, thresh=0.01):
-  '''compute agreement between predicted and measured contact map'''
-
-  eval_idx = jnp.triu_indices_from(true, 6)
-
-  true = jnp.asarray(true)
-  pred = jnp.asarray(pred)
-
-  if mask is not None:
-    idx = mask.sum(-1) > 0
-    true = true[idx,:][:,idx]
-    pred = pred[idx,:][:,idx]
-  pred_, true_ = pred[eval_idx], true[eval_idx]
-
-  L = (np.linspace(0.1,1.0,10)*len(true)).astype("int")
-
-  sort_idx = jnp.argsort(pred_)[::-1]
-  acc=[]
-  for l in L:
-    tmp = lax.dynamic_slice(sort_idx,[0,],[l,])
-    acc.append(jnp.mean(true_[tmp]>thresh))
-
-  return jnp.mean(jnp.asarray(acc))
-
-def clear_mem():
-  backend = jax.lib.xla_bridge.get_backend()
-  for buf in backend.live_buffers(): buf.delete()
-
 def norm_row_col(z, z_mask, norm_mode):
   
   if norm_mode == "fast":
@@ -119,24 +78,6 @@ def Conv1D_custom(params=None):
   else: return layer
 
 ##############################################################
-
-def sub_sample(x, samples=1024, seed=0):
-  np.random.seed(seed)
-  idx = np.arange(1,len(x))
-  idx = np.random.choice(idx,samples-1,replace=False)
-  idx = np.append(0,idx)
-  return [x[i] for i in idx]
-
-def pad_max(a, pad=-1):
-  max_L = len(max(a,key = lambda x: len(x)))
-  b = np.full([len(a),max_L], pad)
-  for i,j in enumerate(a): b[i][0:len(j)] = j
-  return b
-
-def one_hot(x,cat=None):
-  if cat is None: cat = np.max(x)+1
-  oh = np.concatenate((np.eye(cat),np.zeros([1,cat])))
-  return oh[x]
 
 def con_auc(true, pred, mask=None, thresh=0.01):
   '''compute agreement between predicted and measured contact map'''
@@ -193,7 +134,7 @@ class MODEL:
 
         # inputs
         self.X = X
-        self.lengths = X.sum([1,2]).astype(int) if lengths is None else lengths
+        self.lengths = X.sum((1,2)).astype(int) if lengths is None else lengths
         self.X_ref = self.X[:1]
         self.X_ref_len = self.lengths[0]
 
