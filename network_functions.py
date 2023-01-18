@@ -381,8 +381,8 @@ class MODEL:
         '''train model'''
         loss = 0
         for k in range(steps):
-            #idx = np.random.randint(0,self.X.shape[0],size=self.p["batch_size"])
-            idx = np.arange(0, self.X.shape[0])
+            idx = np.random.randint(0,self.X.shape[0],size=self.p["batch_size"])
+            #idx = np.arange(0, self.X.shape[0])
             inputs = {"x":self.X[idx], "lengths":self.lengths[idx],
                     "x_ref":self.X_ref, "key":self.key.get(10)}
             if self.p["use_nat_aln"] or self.p["add_aln_loss"]: inputs["aln"] = self.nat_aln[idx]
